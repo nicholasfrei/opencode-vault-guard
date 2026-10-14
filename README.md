@@ -1,12 +1,26 @@
 # OpenCode Vault Guard
 
-A standalone OpenCode V2 plugin that reduces **accidental credential leakage to LLM providers**. It filters GitHub tokens, AWS credentials, Vault tokens, passwords, private keys, and other recognized secrets from tool results and outgoing model payloads.
+OpenCode Vault Guard is a local OpenCode V2 plugin that reduces accidental credential leakage to LLM providers. It scans tool results and outgoing model payloads for known secret values and common credential formats, then redacts or blocks matching content.
 
-The plugin runs locally inside OpenCode. Vault supplies selected known secret values; prompts and tool output are **not sent to Vault for scanning**. There is no separate proxy to deploy and no change to the Vault server.
+Vault is an optional source of known secret values. Prompts and tool output are scanned locally and are **not sent to Vault**. The plugin does not require a proxy or changes to the Vault server.
+
+> **Status:** Experimental. End-to-end tested with OpenCode 2.0.25. Requires Node.js 22 or newer. The package declares an OpenCode peer dependency of `>=2.0.25 <2.1.0`.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Add Vault-backed matching](#add-vault-backed-matching)
+- [Configuration reference](#configuration-reference)
+- [How inspection works](#how-inspection-works)
+- [Metrics](#metrics)
+- [Limitations and security boundaries](#limitations-and-security-boundaries)
+- [Development and tests](#development-and-tests)
+- [Copilot compatibility](#copilot-compatibility)
+- [References](#references)
 
 ## Quick start
 
-Requires OpenCode V2. Tested end-to-end with **OpenCode 2.0.25**. Development requires Node 22+ and npm.
+Install dependencies and build the plugin:
 
 ```sh
 cd ~/repos/opencode-vault-guard
@@ -14,7 +28,9 @@ npm ci --ignore-scripts
 npm run build
 ```
 
-Merge this entry into `plugins` in `~/.config/opencode/opencode.jsonc` for all projects, or your project's `opencode.jsonc`:
+`dist/` is Git-ignored, so a fresh clone must run the build before OpenCode can load `index.js`. The commands above use `--ignore-scripts`, which skips lifecycle hooks. For a Git URL npm dependency, `prepare` builds `dist/` during installation; a prebuilt npm tarball also includes `dist/` through `prepack`. Keep Node.js 22+ and the build dependencies available when installing from Git.
+
+Register the **package directory** in `~/.config/opencode/opencode.jsonc` (all projects) or a project's `opencode.jsonc`:
 
 ```jsonc
 {
@@ -31,21 +47,21 @@ Merge this entry into `plugins` in `~/.config/opencode/opencode.jsonc` for all p
 }
 ```
 
-Use the **directory**, not `dist/index.js`. OpenCode 2.0.25 requires a root entrypoint for local directory plugins; this package includes `index.js` for that loader. Place the guard after other content-mutating plugins.
+Merge this entry into the existing `plugins` array if needed. Use the directory, not `dist/index.js`: OpenCode 2.0.25 expects a root entrypoint for local directory plugins, and this package's `index.js` loads the built plugin. Place Vault Guard after other plugins that modify content.
 
-Restart the background service after building or registering:
+Restart the background service after building or changing registration:
 
 ```sh
 opencode service restart
 ```
 
-For an isolated trial, run `opencode --standalone` from a project containing the config. Confirm `vault.guard` is active in that location's plugin list. These files provide registration examples; installing/building this project does not edit your OpenCode configuration.
+For an isolated trial, run `opencode --standalone` from a project with the config and confirm `vault.guard` is active in that location's plugin list. The examples in [`examples/`](examples/) are starting points; building or installing this package does not edit OpenCode configuration.
 
-The minimal setup enables pattern detection without requiring Vault. `examples/opencode.jsonc` is a copyable starting point.
+This minimal configuration enables built-in pattern detection and does not require Vault. See [`examples/opencode.jsonc`](examples/opencode.jsonc) for a copyable version.
 
 ## Add Vault-backed matching
 
-Add a `vault` object to the options:
+Vault matching adds exact-value detection for explicitly selected KV v2 fields and configured environment variables. Add a `vault` object to the plugin options:
 
 ```jsonc
 {
@@ -65,88 +81,87 @@ Add a `vault` object to the options:
 }
 ```
 
-This reads `GET /v1/kv/data/development/credentials` and selects the two top-level string fields. Vault ACLs operate on the whole secret path: the Vault response contains the whole KV object, even though only selected fields are retained for matching. Use a narrowly scoped credential collection.
+This reads `GET /v1/kv/data/development/credentials` and retains the selected top-level string fields for matching. Vault ACLs apply to the whole secret path: the response includes the full KV object, even though the plugin only retains the named fields. Prefer a narrowly scoped credential collection. Grant the plugin identity `read` on the path; see [`examples/vault-policy.hcl`](examples/vault-policy.hcl). The plugin does not list secrets, write to Vault, issue dynamic credentials, or require a Vault Enterprise feature.
 
-Grant the plugin identity `read` on that path; see `examples/vault-policy.hcl`. No listing, writes, root token, dynamic credential issuance, or Vault Enterprise feature is required. Dynamic credentials already available in environment variables can be included using `env` below.
+Authentication options:
 
-Authentication choices:
+- **Vault Agent token file:** Set `tokenFile` to an absolute path. The file is re-read on refresh; Vault Agent handles login and renewal.
+- **Environment variable:** Omit `tokenFile` and provide `VAULT_TOKEN` to the OpenCode server process, or set `tokenEnv` to another variable name. A configured token file takes precedence.
 
-- **Vault Agent token file:** `tokenFile` is an absolute file path, re-read on refresh. Agent handles login and renewal.
-- **Environment:** omit `tokenFile` and supply `VAULT_TOKEN` to the **OpenCode server process**, or set `tokenEnv` to another variable name. A token file takes precedence when configured.
+`address` defaults to `VAULT_ADDR`; `namespace` defaults to `VAULT_NAMESPACE`. HTTPS is required except for loopback development servers. Standard TLS certificate validation remains enabled. Vault CLI-specific TLS variables, login flows, and token renewal are not implemented by this plugin.
 
-`address` defaults to `VAULT_ADDR`; `namespace` defaults to `VAULT_NAMESPACE`. HTTPS is required except for loopback development servers. Normal runtime certificate validation stays enabled. This prototype does not implement Vault CLI-specific TLS variables, login flows, or token renewal.
+The inventory loads on the first guarded operation and refreshes every 60 seconds by default. Concurrent reads are coalesced. If a refresh is due and any configured field is missing, access is denied, the request times out, or the response is malformed, payloads are withheld until a complete refresh succeeds. Values seen previously remain matched until the plugin unloads, so rotation does not expose older conversation content. Versions this instance has never observed are not in its inventory; reloading clears the in-memory history.
 
-The inventory loads lazily at the first guarded operation, refreshes after 60 seconds by default, and coalesces concurrent reads. Once refresh is due, a missing field, denied read, timeout, or malformed response blocks payloads until a complete refresh succeeds. Previously observed values remain matched until plugin unload, protecting older conversation content after rotation. Versions never observed by this instance are not in the inventory. Reloading loses that in-memory history.
+Secret values and the Vault authentication token are held in process memory, not in a plugin cache file. JavaScript strings cannot be reliably zeroized.
 
-Values exist in process memory, not a plugin cache file. JavaScript strings cannot be reliably zeroized. The plugin's Vault authentication token is also included in known-value matching.
+## Configuration reference
 
-## Detection and behavior
+Unknown options are rejected. Defaults and valid ranges are enforced during plugin setup.
 
-| Layer | Coverage |
-| --- | --- |
-| Known values | Selected Vault KV v2 fields and explicitly named environment variables; raw, URI-encoded, JSON-escaped, Base64, and Base64url representations. |
-| Patterns | Common GitHub, AWS access-key ID, Vault, GitLab (including runner), Slack, npm, PyPI, SendGrid, OpenAI/Anthropic, Stripe and Google API/OAuth token formats; Twilio key identifiers; Slack/Discord webhook URLs; JWTs, private keys, credential-bearing URLs, authorization text, and credential assignments/JSON fields. |
-| Entropy | Optional high-entropy token heuristic, disabled by default to reduce false positives. |
-
-AWS secret access keys and session tokens do not have a universal recognizable prefix. Use exact inventory matching for bare values; the contextual rules also detect labeled assignments such as `AWS_SECRET_ACCESS_KEY=...` and structured credential fields. Pattern findings are suspected credentials, not proof they are live.
-
-Credential URLs include `redis://:password@host` and `rediss://:password@host` without a username. Plain `token=...` assignments are scanned alongside structured token fields. Discord rules cover current, legacy `discordapp.com`, and versioned API URLs. These detectors work without Vault inventory or entropy detection.
-
-`redact` replaces detected spans with `[REDACTED]` and preserves surrounding context. `block` withholds an entire matching payload. Both modes withhold payloads when inspection fails. Redaction scans JSON string values and object keys after JSON decoding, including nested tool metadata and model tool descriptions; benign HTTP JSON retains its original bytes.
-
-The interception points are:
-
-- `tool.execute.after`: successful results, structured output, metadata, and error messages for every tool. Error causes and metadata are dropped.
-- `session.http.request`: the native outgoing JSON body, including primary, title, compaction, and session-generation calls using this hook.
-- `session.experimental.ws.send`: outgoing JSON WebSocket frames.
-
-HTTP failures install an aborted, empty, credential-free request and raise a generic error. WebSocket failures replace the frame with a fixed non-content error event and raise a generic error. Tool failures produce a fixed withheld-content message. No diagnostic contains a secret prefix or suffix. Failure behavior was exercised inside the real OpenCode host, not only mocked hooks.
-
-## Options
-
-| Option | Default | Meaning |
+| Option | Default | Description |
 | --- | --- | --- |
-| `mode` | `"redact"` | `"redact"` or `"block"`. |
+| `mode` | `"redact"` | `"redact"` replaces matches; `"block"` withholds the whole matching payload. |
 | `patterns` | `true` | Enable built-in token and credential-context rules. |
-| `entropy` | `false` | Enable entropy heuristic. |
-| `env` | `[]` | Names of environment variables whose values must be protected. Every named variable must exist. |
-| `maxBodyBytes` | `4194304` | Maximum inspected payload size, 1 KiB–16 MiB. Larger payloads are withheld. |
-| `metricsPort` | omitted | Opt-in loopback Prometheus listener. `0` picks an available port, logged at startup. |
-| `vault.address` | `VAULT_ADDR` | Vault origin, optionally including a port. No URL credentials, path prefix, query, or fragment. |
+| `entropy` | `false` | Enable the high-entropy token heuristic. Disabled by default to reduce false positives. |
+| `env` | `[]` | Names of environment variables whose values should be matched. Every listed variable must exist. Example: `["GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"]`. |
+| `maxBodyBytes` | `4194304` | Maximum inspected payload size (1 KiB–16 MiB). Larger payloads are withheld. |
+| `metricsPort` | omitted | Opt-in loopback Prometheus listener. Set to `0` to select an available port; the chosen port is logged at startup. |
+| `vault.address` | `VAULT_ADDR` | Vault origin, optionally with a port. URL credentials, path prefixes, queries, and fragments are not accepted. |
 | `vault.namespace` | `VAULT_NAMESPACE` | Optional namespace path. |
-| `vault.tokenEnv` | `"VAULT_TOKEN"` | Authentication token variable. |
-| `vault.tokenFile` | omitted | Absolute token-sink path; overrides `tokenEnv`. |
-| `vault.secrets` | required with `vault` | Explicit `{mount, path, fields}` entries for KV v2. |
-| `vault.refreshMs` | `60000` | Refresh interval, 1–300 seconds. |
-| `vault.timeoutMs` | `3000` | Deadline for the full Vault refresh, 100–10000 ms. |
+| `vault.tokenEnv` | `"VAULT_TOKEN"` | Environment variable containing the Vault token. |
+| `vault.tokenFile` | omitted | Absolute path to a Vault Agent token file. Overrides `tokenEnv`. |
+| `vault.secrets` | required when `vault` is set | Explicit KV v2 `{mount, path, fields}` entries. |
+| `vault.refreshMs` | `60000` | Inventory refresh interval (1–300 seconds). |
+| `vault.timeoutMs` | `3000` | Deadline for the full Vault refresh (100–10000 ms). |
 
-Example environment inventory: `"env": ["GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"]`. Only list variables actually set in the OpenCode server's environment. An existing shared service does not inherit environment changes from a newly opened terminal.
+Additional limits: inventory values must be nonblank strings of 4–65,536 characters; the retained inventory is capped at 1,000 values and 2 MiB. Nested or non-string KV fields are unsupported. Mount and path segments currently accept letters, digits, `_`, and `-`. Exceeding an inventory limit withholds payloads rather than silently dropping protection.
 
-Unknown options are rejected. Inventory values must be nonblank strings of 4–65,536 characters; the retained inventory is bounded to 1,000 values and 2 MiB. Nested/non-string KV fields are not supported. Path segments currently accept letters, digits, `_`, and `-`. Exceeding limits withholds payloads rather than evicting protection silently.
+Environment variables are read by the OpenCode server process. An already-running shared service does not inherit environment changes from a newly opened terminal; restart it after changing its environment.
 
-## Telemetry: secret exposure prevented
+## How inspection works
 
-Yes—this is useful telemetry, provided its meaning is precise. The counters measure **matching spans removed or withheld at a guard boundary**, not unique credentials, confirmed compromises, or proof that an entire session is secret-free.
+### Detection
+
+| Detector | What it checks |
+| --- | --- |
+| Known values | Selected Vault KV v2 fields, the Vault authentication token, and explicitly named environment variables. Also matches raw, URI-encoded, JSON-escaped, Base64, and Base64url representations. |
+| Patterns | Common GitHub, AWS access-key ID, Vault, GitLab (including runner), Slack, npm, PyPI, SendGrid, OpenAI/Anthropic, Stripe, and Google API/OAuth token formats; Twilio key identifiers; Slack/Discord webhook URLs; JWTs; private keys; credential-bearing URLs (including Redis); authorization text; and credential assignments/JSON fields. |
+| Entropy | Optional high-entropy token heuristic. Disabled by default. |
+
+AWS secret access keys and session tokens have no universal recognizable prefix. Use exact inventory matching for bare values; contextual rules can also detect labeled values such as `AWS_SECRET_ACCESS_KEY=...` and structured credential fields. Pattern matches are suspected credentials, not proof that a credential is live.
+
+Rules for plain `token=...` assignments and structured token fields work without Vault or entropy detection. Discord webhook detection includes current and legacy hosts and versioned API URLs.
+
+### Interception and failure behavior
+
+| OpenCode hook | Inspected content |
+| --- | --- |
+| `tool.execute.after` | Successful results and tool error messages for every tool, including structured output and metadata. Error causes and metadata are dropped. |
+| `session.http.request` | Native outgoing JSON bodies, including primary, title, compaction, and session-generation requests that use this hook. |
+| `session.experimental.ws.send` | Outgoing JSON WebSocket frames. |
+
+In `redact` mode, detected spans become `[REDACTED]` and surrounding context is preserved. In `block` mode, the entire matching payload is withheld. Inspection failures are withheld in either mode. JSON string values and object keys are scanned after decoding, including nested tool metadata and model tool descriptions. HTTP JSON with no match retains its original bytes.
+
+Failures use fixed, credential-free messages: HTTP requests are replaced with an aborted empty request, WebSocket frames with a non-content error event, and tool output with a withheld-content message. Diagnostics do not include secret prefixes or suffixes. Failure behavior has also been exercised inside the OpenCode host, not only with mocked hooks.
+
+## Metrics
+
+Metrics are opt-in, local to the machine, and served on loopback. Nothing is pushed to an external collector. With `metricsPort: 9464`, inspect them with:
 
 ```sh
 curl http://127.0.0.1:9464/metrics
 ```
 
-Metrics:
+Available counters and gauge:
 
-- `vault_guard_secret_matches_prevented_total{surface,action,detector}`
-- `vault_guard_blocked_payloads_total{surface,reason}`
-- `vault_guard_scans_total{surface}`
-- `vault_guard_active_instances`: plugin instances contributing to the listener.
+- `vault_guard_secret_matches_prevented_total{surface,action,detector}` — matching spans removed or withheld at a guard boundary.
+- `vault_guard_blocked_payloads_total{surface,reason}` — payloads withheld, including inspection failures.
+- `vault_guard_scans_total{surface}` — payloads inspected.
+- `vault_guard_active_instances` — plugin instances contributing to the listener.
 
-The only labels are fixed categories:
+Labels are fixed categories only: `surface` is `tool`, `http`, or `websocket`; `action` is `redact` or `block`; `detector` is `known`, `pattern`, or `entropy`; `reason` is `inventory`, `format`, `limit`, `secret`, or `internal`. Metrics contain no secret values or hashes, secret names or paths, prompts, provider IDs, user IDs, or session IDs.
 
-- `surface`: `tool`, `http`, `websocket`
-- `action`: `redact`, `block`
-- `detector`: `known`, `pattern`, `entropy`
-- `reason`: `inventory`, `format`, `limit`, `secret`, `internal`
-
-Example dashboard query for matches stopped at model dispatch in the last day:
+The match counter is **not** a count of unique credentials, confirmed compromises, or proof that an entire session is secret-free. Repeated transcript uploads, retries, and tool reads can count the same credential again. Overlapping matches are merged into one redacted span, with known-value evidence taking precedence. Use `surface="tool"` to track removals before model context; `surface=~"http|websocket"` tracks matches at model dispatch. For example, matches stopped at model dispatch over the previous day, grouped by detector:
 
 ```promql
 sum by (detector) (
@@ -154,61 +169,79 @@ sum by (detector) (
 )
 ```
 
-Show `surface="tool"` separately for secrets removed before reaching model context. Repeated transcript uploads, retries, and repeated tool reads may count the same credential again. Overlapping detector matches merge into one redacted span; known-value evidence takes precedence. There are no secret values, hashes, names, paths, prompts, provider IDs, user IDs, or session IDs in telemetry.
+Instances in one OpenCode process that use the same fixed port share a listener and aggregate counters. Unloading one instance leaves it available to the others; counters reset when the last instance unloads or the process exits. Port `0` creates a separate ephemeral listener per instance. Separate OpenCode processes cannot share a listener, so use different ports. If a configured port is already owned by another process, metrics binding fails with a generic diagnostic while filtering remains active. These are plugin metrics, not metrics added to Vault's `/sys/metrics` endpoint.
 
-Metrics are local and opt-in. Nothing is pushed to an external collector. Each OpenCode location has its own plugin instance. Instances using the same fixed metrics port **in one OpenCode process** share a listener and aggregate counters. `vault_guard_active_instances` shows how many are contributing; zero-valued scan counters are exposed before any scans occur. Unloading one instance keeps the listener alive for the others. Counters reset when the final contributing instance unloads or the process exits.
+## Limitations and security boundaries
 
-Port `0` creates a separate ephemeral listener per instance. Separate OpenCode processes cannot share a listener; give them different ports. If another process owns a configured port, telemetry binding fails with a generic diagnostic while filtering remains active. This is plugin telemetry, not a metric added to Vault's `/sys/metrics` endpoint.
+Vault Guard is an accidental-leak guard, not an adversarial sandbox or a complete DLP service.
 
-## Coverage boundaries
+- Detection depends on a known inventory value, a built-in pattern, or the optional entropy heuristic. Split values, arbitrary encoding/encryption, and secrets inside opaque binary data can evade detection.
+- Inspection is text/JSON focused. Recognized image, audio, document, and file payloads are withheld; OCR and arbitrary attachment unpacking are not supported. Unknown provider-specific binary formats are not certified.
+- Compressed or non-JSON HTTP bodies are withheld. For a provider that compresses requests, set `providers.<id>.settings.encoding` to `"none"`. Native signed-body providers are not validated; rewriting a signed request may invalidate its signature.
+- Intentional provider authentication headers and request URLs are outside the content filter. Arbitrary HTTP calls made by tools or plugins, MCP transport, web searches, uploads outside session hooks, and direct `ctx.generate.text` calls are not covered by the session-egress guarantee.
+- Prompts and existing history can remain stored locally without redaction. The outgoing-request hook changes the provider payload, not the canonical transcript, and cannot retract credentials sent in an earlier session.
+- Protection requires the plugin to load and remain enabled. Later hooks could reintroduce secrets. Host policy or egress controls are needed for guarantees against plugin load/import failures, plugin removal, or a malicious agent modifying its own protection.
 
-This is an accidental-leak guard, not an adversarial sandbox or a complete DLP service.
+## Development and tests
 
-- A credential must match an inventory value, a pattern, or the enabled entropy heuristic. Splitting values across messages, arbitrary encoding/encryption, and secrets hidden inside opaque binary data can evade detection.
-- The prototype is text/JSON focused. Recognized image, audio, document, and file payloads are withheld; it does not perform OCR or unpack arbitrary attachments. Unknown provider-specific binary representations are not certified.
-- Compressed/non-JSON HTTP bodies are withheld. For a provider that compresses requests, set `providers.<id>.settings.encoding` to `"none"`. Native signed-body providers are not validated; rewriting a signed request may invalidate its signature.
-- Intentional provider authentication headers and request URLs are outside the content filter. Arbitrary HTTP calls made by tools/plugins, MCP transport, web searches, uploads outside session hooks, and direct `ctx.generate.text` calls are not covered by the session-egress guarantee.
-- User prompts and pre-existing history can still be stored locally unredacted. The outgoing-request hook changes the provider payload, not the canonical transcript. This cannot retract credentials already sent in an older session.
-- The plugin must be loaded and enabled, and later hooks must not reintroduce secrets. Load/import failures, removed plugins, or a malicious agent modifying its own protection require host policy/egress controls beyond this prototype.
-
-## Copilot
-
-**GitHub Copilot as an OpenCode provider** uses the same OpenCode interception boundary. Real-provider Copilot traffic has not been used for validation; the integration test uses a local OpenAI-compatible endpoint.
-
-The standalone **Copilot CLI, VS Code extension, and Copilot SDK** have different extension APIs. This package does not register into those clients. A next adapter can reuse `Scanner`, `Inventory`, and `Guard` behind Copilot's result/prompt hooks or a supported gateway. GitHub's current CLI hook documentation explicitly allows hook failures/timeouts to fall through in several cases, so matching the OpenCode failure behavior needs separate verification. A generic HTTP proxy is another option when the client supports an explicit provider endpoint; a Vault secrets-engine plugin alone is not an LLM egress proxy.
-
-## Verification and development
+### Local workflow
 
 ```sh
+npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm run build
-npm run test:metrics
-npm run test:smoke
 ```
 
-The smoke test requires `vault` and `opencode` on `PATH`. It starts a disposable loopback Vault dev server, creates a scoped reader token, loads the built plugin into an isolated OpenCode process, and sends synthetic credentials through a fake local model endpoint. It validates prompt/tool-output redaction plus block mode, a revoked Vault token, and invalid configuration. No real LLM credentials are used. Enterprise Vault can use an existing `VAULT_LICENSE` or `VAULT_LICENSE_PATH` for the local fixture. Set `VAULT_GUARD_TEST_VAULT` to select another binary or `VAULT_GUARD_TEST_PLUGIN` to test an installed package directory.
+| Command | Purpose and requirements |
+| --- | --- |
+| `npm run typecheck` | Type-check source and tests without emitting files. |
+| `npm test` | Run the unit and integration test suite. |
+| `npm run build` | Compile the plugin into `dist/`. |
+| `npm run test:smoke` | Run an isolated host-level smoke test. Requires `vault` and `opencode` on `PATH`; uses a disposable loopback Vault dev server and a fake local model endpoint, not real LLM credentials. |
+| `npm run test:metrics` | Verify metrics and redaction from two OpenCode locations against a loopback fake model. Requires OpenCode on `PATH`; set `OPENCODE_BIN` to choose a binary. Does not restart the user's OpenCode service. |
+| `npm run test:live` | Explicit, installation-specific live Vault/Copilot harness; see [Live Vault validation](#live-vault-validation). Not part of `npm test`. |
 
-`test:metrics` starts one isolated OpenCode server and exercises two project locations against a loopback model endpoint. It checks that both locations contribute scans and redactions to the same fixed-port listener, exposes two active instances, and confirms no synthetic credential reaches the fake provider. It needs only OpenCode on `PATH`; set `OPENCODE_BIN` to select an explicit binary. It uses an isolated service registration and does not restart the user's OpenCode server.
+For the smoke test, `VAULT_GUARD_TEST_VAULT` selects the Vault binary and `VAULT_GUARD_TEST_PLUGIN` selects a built plugin directory. Enterprise Vault can use an existing `VAULT_LICENSE` or `VAULT_LICENSE_PATH` for the local fixture.
 
-Unit/integration tests cover HTTP delivery, WebSocket frame transformation, JSON escaping, body limits, error handling, rotation, cache refresh, credential context, and telemetry. Native WebSocket delivery has hook-level coverage; a real-provider WebSocket end-to-end test remains future work.
+The unit and integration tests cover HTTP delivery, WebSocket frame transformation, JSON escaping, body limits, error handling, secret rotation and refresh, credential context, and metrics. Native WebSocket delivery has hook-level coverage; a real-provider WebSocket end-to-end test remains future work. `test/detector-gaps.test.ts` exercises the credential families in both scanner and HTTP-guard paths; the shared synthetic corpus is in `test/fixtures/credentials.ts`.
 
-`test/detector-gaps.test.ts` exercises each formerly missing credential family through both the scanner and native HTTP guard in redact/block modes. The shared synthetic corpus is in `test/fixtures/credentials.ts`; boundary cases include truncated tokens, lookalike webhook hosts, trailing token punctuation, and overlapping URI rules.
+### Project layout
 
-### Existing-cluster and Copilot trial
+| Path | Responsibility |
+| --- | --- |
+| `index.js` | Root entrypoint used by OpenCode's local directory plugin loader. |
+| `src/index.ts` | Registers OpenCode hooks and owns plugin setup/teardown. |
+| `src/config.ts` | Validates plugin options and applies defaults. |
+| `src/inventory.ts` | Loads configured environment/Vault values and refreshes the in-memory inventory. |
+| `src/scanner.ts` | Detects and redacts known values, patterns, and optional entropy matches. |
+| `src/guard.ts` | Applies inspection and failure behavior at tool, HTTP, and WebSocket boundaries. |
+| `src/metrics.ts` | Maintains counters and serves the optional Prometheus endpoint. |
+| `test/` | Unit, integration, host smoke, and live-test harnesses. |
+| `examples/` | OpenCode configuration examples and a sample Vault policy. |
 
-`test/live-vault.ts` is an explicitly invoked, installation-specific live integration harness. It uses the existing local Vault cluster and a standalone OpenChamber OpenCode 2.0.25 runtime, then exercises the configured Copilot provider with synthetic canaries. Its trial configuration disables the old guard and enables Vault Guard; original global configuration stays in place.
+### Live Vault validation
 
-The harness creates and cleans up a unique KV fixture, an exact-path temporary policy, and a short-lived token. It requires `VAULT_GUARD_LIVE_APPROVED=1`, inherited authentication, and the connection settings described in [the live validation report](docs/live-vault-validation.md). After confirming those settings, invoke it with `npm run test:live`. It is excluded from `npm test`.
+`test/live-vault.ts` targets an existing loopback Vault cluster and a standalone OpenCode 2.0.25+ runtime, then exercises an explicitly selected Copilot model with synthetic canaries. The trial configuration disables the replaced plugin and enables Vault Guard; the original global configuration remains in place.
 
-The report records observed detection, performance, runtime-state, and cleanup evidence. It also documents a separate credential-exposure incident in a debugging diagnostic outside the guarded trial runtime; passing synthetic tests does not establish that the entire investigation was exposure-free.
+The harness creates and cleans up a unique KV fixture, an exact-path temporary policy, and a short-lived token. It requires `VAULT_GUARD_LIVE_APPROVED=1`, inherited `VAULT_TOKEN`, `VAULT_GUARD_LIVE_NAMESPACE`, and `VAULT_GUARD_LIVE_MODEL=github-copilot/<model-id>`. Set `VAULT_ADDR` (defaults to `http://127.0.0.1:8200`) and `VAULT_GUARD_LIVE_MOUNT` (defaults to `kv`) for the selected KV v2 mount. It reads `~/.config/opencode/opencode.json` by default; set `VAULT_GUARD_LIVE_CONFIG_FILE` to a different JSON config file and `VAULT_GUARD_LIVE_OPENCODE` to choose a binary instead of `opencode` on `PATH`. `VAULT_GUARD_LIVE_TMPDIR` overrides the platform temporary directory.
 
-`npm pack` produces an installable tarball. The package is marked private to avoid accidental publication while the API is experimental.
+Optional: `VAULT_GUARD_LIVE_REPLACED_PLUGIN` names the plugin to disable (default `opencode-secrets-protect`); `VAULT_GUARD_LIVE_REQUIRED_PLUGINS` is a comma-separated list of other plugin IDs whose active state must be verified. `VAULT_GUARD_LIVE_SNAPSHOT_FILES` is a platform-path-delimiter-separated list of additional files to check for unchanged content/mode. `VAULT_GUARD_LIVE_SERVER` enables a before/after PID and version check of an existing shared service; without it the harness does not contact a shared service. Review the target and permissions before explicitly running `npm run test:live`. This test is excluded from `npm test`.
 
-## Design references
+Local trial artifacts are written under ignored `docs/` only after an approved run starts, and are not part of Git or the npm package. Do not publish these installation-specific results without reviewing them for sensitive metadata. A previously conducted limited Copilot trial observed detection, performance, and cleanup, but synthetic canaries do not establish that an entire investigation was exposure-free.
 
-- [Reference plugin source](https://github.com/jscheel/opencode-secrets-protect/blob/master/src/index.ts): V1 `tool.execute.after` filter for `read`, `bash`, and `grep`, blocking the full output. This implementation is new code with broader V2 interception and Vault inventory matching.
-- [OpenCode V2 plugin hooks](https://opencode.ai/v2/docs/build/plugins) and [registration](https://opencode.ai/v2/docs/plugins).
+`npm pack` produces an installable tarball. The package is marked private to avoid accidental publication while its API is experimental.
+
+## Copilot compatibility
+
+GitHub Copilot used **as an OpenCode provider** goes through the same OpenCode interception boundary. A limited live trial with synthetic canaries exercised Copilot over native HTTP as well as the local OpenAI-compatible test endpoint. It did not establish comprehensive coverage of Copilot traffic or validate real-provider WebSocket delivery.
+
+The standalone Copilot CLI, VS Code extension, and Copilot SDK have different extension APIs. This package does not register with those clients. An adapter could reuse `Scanner`, `Inventory`, and `Guard` behind their supported prompt/result hooks or a supported gateway. GitHub's current CLI hook documentation allows some failures and timeouts to fall through, so matching OpenCode's failure behavior requires separate validation. A generic HTTP proxy is another option when a client supports an explicit provider endpoint; a Vault secrets-engine plugin alone is not an LLM egress proxy.
+
+## References
+
+- [OpenCode V2 plugin hooks](https://opencode.ai/v2/docs/build/plugins) and [plugin registration](https://opencode.ai/v2/docs/plugins).
 - [OpenCode providers, compression, and WebSocket behavior](https://opencode.ai/v2/docs/providers).
 - [Vault KV v2 read API](https://developer.hashicorp.com/vault/api-docs/secret/kv/kv-v2#read-secret-version).
 - [Copilot hook contracts and failure behavior](https://docs.github.com/en/copilot/reference/hooks-reference).
+- [Reference plugin source](https://github.com/jscheel/opencode-secrets-protect/blob/master/src/index.ts): a V1 `tool.execute.after` filter for selected tools that blocks full output. Vault Guard is new code with broader V2 interception and Vault inventory matching.

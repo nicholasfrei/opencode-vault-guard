@@ -6,8 +6,8 @@ import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { credentialFixtures } from "./fixtures/credentials.js";
@@ -20,20 +20,23 @@ if (process.env.VAULT_GUARD_LIVE_APPROVED !== "1") {
 }
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const binary = "/Applications/OpenChamber.app/Contents/Resources/opencode-cli/opencode";
-const namespace = process.env.VAULT_GUARD_LIVE_NAMESPACE ?? "tf-34835-1791830864";
-const mount = process.env.VAULT_GUARD_LIVE_MOUNT ?? "kv_secret";
+const binary = process.env.VAULT_GUARD_LIVE_OPENCODE ?? process.env.OPENCODE_BIN ?? "opencode";
+const namespace = process.env.VAULT_GUARD_LIVE_NAMESPACE ?? "";
+const mount = process.env.VAULT_GUARD_LIVE_MOUNT ?? "kv";
 const vaultAddress = process.env.VAULT_ADDR ?? "http://127.0.0.1:8200";
 const adminToken = process.env.VAULT_TOKEN;
-const sharedURL = process.env.VAULT_GUARD_LIVE_SERVER ?? "http://127.0.0.1:63253";
-const model = process.env.VAULT_GUARD_LIVE_MODEL ?? "github-copilot/claude-haiku-5.5";
+const sharedURL = process.env.VAULT_GUARD_LIVE_SERVER;
+const model = process.env.VAULT_GUARD_LIVE_MODEL ?? "";
+const replacedPlugin = process.env.VAULT_GUARD_LIVE_REPLACED_PLUGIN ?? "opencode-secrets-protect";
+const requiredPlugins = process.env.VAULT_GUARD_LIVE_REQUIRED_PLUGINS?.split(",").filter(Boolean) ?? [];
 const marker = "[REDACTED]";
 const runID = randomUUID();
 const fixturePath = `vault-guard-trial/${runID}/fixture`;
 const policyName = `vault-guard-trial-${runID}`;
-const originals = [join(homedir(), ".config/opencode/opencode.json"), join(homedir(), ".config/openchamber/opencode.managed.json"), join(homedir(), ".config/opencode/plugins/opencode-secrets-protect.ts")];
-const tempParent = process.env.TMPDIR ?? "/private/var/folders/39/kl6xgm810z9ct2gzvxvwwcrm0000gn/T/opencode";
-const results: Record<string, any> = { date: new Date().toISOString(), runtime: "2.0.25", vaultAddress, namespace, mount, model, cases: {}, cleanup: {}, limitations: [] };
+const configDir = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
+const originals = [process.env.VAULT_GUARD_LIVE_CONFIG_FILE ?? join(configDir, "opencode.json"), ...(process.env.VAULT_GUARD_LIVE_SNAPSHOT_FILES?.split(delimiter).filter(Boolean) ?? [])];
+const tempParent = process.env.VAULT_GUARD_LIVE_TMPDIR ?? tmpdir();
+const results: Record<string, any> = { date: new Date().toISOString(), vaultAddress, namespace, mount, model, cases: {}, cleanup: {}, limitations: [] };
 const snapshots: { path: string; backup: string; hash: string; mode: number }[] = [];
 let root = "";
 let token = "";
@@ -101,6 +104,7 @@ async function vault(path: string, method = "GET", data?: unknown, credential = 
   return { status: response.status, body };
 }
 function sharedInfo(): { version: string; pid: number } | undefined {
+  if (!sharedURL) return undefined;
   try {
     const output = execFileSync(binary, ["api", "--server", sharedURL, "get", "/api/info"], { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] });
     const parsed: unknown = JSON.parse(output);
@@ -115,8 +119,8 @@ async function run(name: string, config: Record<string, unknown>, prompt: string
   const directory = join(root, name);
   await mkdir(directory, { recursive: true });
   const evidence = join(directory, "evidence.json");
-  const opts = { evidence, fixture: current!.file, grepFixture: current!.grep, needles: join(root, "needles.json"), real, fakeOrigin: `http://127.0.0.1:${(server!.address() as { port: number }).port}` };
-  const plugins = ["-opencode-secrets-protect", { package: join(root, "before"), options: opts }, { package: repo, options: config }, { package: join(root, "after"), options: opts }];
+  const opts = { evidence, fixture: current!.file, grepFixture: current!.grep, needles: join(root, "needles.json"), real, fakeOrigin: `http://127.0.0.1:${(server!.address() as { port: number }).port}`, replacedPlugin, requiredPlugins };
+  const plugins = [`-${replacedPlugin}`, { package: join(root, "before"), options: opts }, { package: repo, options: config }, { package: join(root, "after"), options: opts }];
   const rules = [
     { action: "*", resource: "*", effect: "deny" },
     { action: "read", resource: current!.file, effect: "allow" },
@@ -128,7 +132,7 @@ async function run(name: string, config: Record<string, unknown>, prompt: string
   ];
   const configFile = {
     model: real ? model : "guard-live/guard-live", plugins, snapshots: false,
-    enabled_providers: real ? ["github-copilot", "ibm-bob"] : ["github-copilot", "ibm-bob", "guard-live"],
+    enabled_providers: real ? ["github-copilot"] : ["github-copilot", "guard-live"],
     agents: { build: { system: "Perform only the requested synthetic validation. Never inspect other files or settings. Finish with LIVE_GUARD_OK after the requested tool work.", permissions: rules } },
     providers: real ? { "github-copilot": { settings: { transport: "http" } } } : {
       "guard-live": { name: "Local synthetic validation", env: ["GUARD_LIVE_FAKE_AUTH"], package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: `http://127.0.0.1:${(server!.address() as { port: number }).port}/v1`, transport: "http" }, models: { "guard-live": { name: "Local synthetic validation", capabilities: { tools: true }, limit: { context: 128000, output: 1024 } } } },
@@ -196,11 +200,17 @@ async function run(name: string, config: Record<string, unknown>, prompt: string
 
 try {
   requireThat(adminToken && new URL(vaultAddress).hostname === "127.0.0.1", "Existing loopback Vault and inherited administrative credential required");
-  requireThat(/^[A-Za-z0-9_/-]+$/.test(namespace) && /^[A-Za-z0-9_-]+$/.test(mount), "Invalid trial scope");
-  requireThat(execFileSync(binary, ["--version"], { encoding: "utf8" }).trim() === "opencode v2.0.25", "Expected bundled OpenCode 2.0.25");
+  requireThat(/^[A-Za-z0-9_/-]+$/.test(namespace) && /^[A-Za-z0-9_-]+$/.test(mount), "Explicit namespace and valid mount required for the trial");
+  requireThat(/^github-copilot\/[A-Za-z0-9_.-]+$/.test(model), "Explicit VAULT_GUARD_LIVE_MODEL for Copilot is required");
+  requireThat(/^[A-Za-z0-9_.-]+$/.test(replacedPlugin) && requiredPlugins.every((id) => /^[A-Za-z0-9_.-]+$/.test(id)), "Invalid plugin IDs");
+  const version = execFileSync(binary, ["--version"], { encoding: "utf8" }).trim().match(/^opencode v(2\.0\.(\d+))$/);
+  requireThat(version && Number(version[2]) >= 25, "Expected OpenCode 2.0.25 or later in the 2.0 series");
+  results.runtime = version[1];
   const info = sharedInfo();
-  requireThat(info?.version === "2.0.25", "Current OpenChamber service unavailable before trial");
-  results.sharedPID = info.pid;
+  if (sharedURL) {
+    requireThat(info && info.version === version[1], "Configured shared OpenCode service unavailable or version differs");
+    results.sharedPID = info.pid;
+  }
   root = await mkdtemp(join(tempParent, "vault-guard-live-")); await chmod(root, 0o700);
   await mkdir(join(root, "backups"), { mode: 0o700 });
   for (const [index, path] of originals.entries()) {
@@ -216,9 +226,10 @@ try {
   const globalConfig = JSON.parse(await readFile(originals[0]!, "utf8"));
   globalConfig.enabled_providers = [...new Set([...(globalConfig.enabled_providers ?? []), "guard-live"])];
   await writeFile(join(shadow, "opencode.json"), JSON.stringify(globalConfig), { mode: 0o600 });
-  await symlink(join(homedir(), ".config/opencode/plugins"), join(shadow, "plugins"), "dir");
-  await symlink(join(homedir(), ".config/opencode/skills"), join(shadow, "skills"), "dir");
-  await copyFile(join(homedir(), ".config/opencode/AGENTS.md"), join(shadow, "AGENTS.md"));
+  for (const folder of ["plugins", "skills"]) {
+    if (await stat(join(configDir, folder)).then(() => true, () => false)) await symlink(join(configDir, folder), join(shadow, folder), "dir");
+  }
+  if (await stat(join(configDir, "AGENTS.md")).then(() => true, () => false)) await copyFile(join(configDir, "AGENTS.md"), join(shadow, "AGENTS.md"));
   const health = await vault("sys/health");
   requireThat(health.status === 200 && health.body.sealed === false, "Existing Vault not healthy");
   requireThat(typeof health.body.version === "string" && /^\d+\.\d+\.\d+(?:[+-][A-Za-z0-9.-]+)?$/.test(health.body.version), "Unexpected Vault health response");
@@ -360,10 +371,10 @@ try {
   // No baseline means startup failed before a live service check completed.
   // In particular, rejection paths must not introduce a service read in finally.
   const info = typeof results.sharedPID === "number" ? sharedInfo() : undefined;
-  results.cleanup.sharedServerAvailable = info?.version === "2.0.25";
-  results.cleanup.sharedPIDUnchanged = info?.pid === results.sharedPID;
+  results.cleanup.sharedServerAvailable = !sharedURL || info?.version === results.runtime;
+  results.cleanup.sharedPIDUnchanged = !sharedURL || info?.pid === results.sharedPID;
   if (root) { await rm(root, { recursive: true, force: true }); results.cleanup.temporaryFilesRemoved = true; }
-  results.cleanup.all = Object.entries(results.cleanup).every(([k, v]) => k === "configFilesVerified" ? v === 3 : v === true);
+  results.cleanup.all = Object.entries(results.cleanup).every(([k, v]) => k === "configFilesVerified" ? v === originals.length : v === true);
   if (!results.cleanup.all) results.passed = false;
   let reportWritten = false;
   if (liveRunStarted) {

@@ -18,6 +18,7 @@
     "test:smoke": "node --import tsx test/smoke.ts",
     "test:metrics": "node --import tsx test/metrics-host.ts",
     "test:live": "node --import tsx test/live-vault.ts",
+    "prepare": "npm run build",
     "prepack": "npm run build"
   },
   "peerDependencies": { "@opencode/plugin": ">=2.0.25 <2.1.0" },

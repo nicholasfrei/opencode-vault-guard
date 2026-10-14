@@ -10,6 +10,8 @@ type Options = {
   needles: string;
   real: boolean;
   fakeOrigin: string;
+  replacedPlugin: string;
+  requiredPlugins: string[];
 };
 type Evidence = {
   beforeHttp: number;
@@ -82,9 +84,9 @@ export const before = Plugin.define({
       const list = await ctx.plugin.list();
       const plugins = Array.isArray(list) ? list : list.data;
       const active = (id: string) => plugins.some((p) => p.id === id && p.state.status === "active");
-      shared.evidence.oldAbsent = !active("opencode-secrets-protect");
+      shared.evidence.oldAbsent = !active(options.replacedPlugin);
       shared.evidence.newActive = active("vault.guard");
-      shared.evidence.realPluginsActive = ["nicholas.notifications", "nicholas.vault-k8s-env", "hashicorp.ibm-bob.gateway", "openchamber-agent-tool"].every(active);
+      shared.evidence.realPluginsActive = options.requiredPlugins.every(active);
       const index = (id: string) => plugins.findIndex((p) => p.id === id);
       shared.evidence.probeOrderCorrect = index("vault.guard.live.before") < index("vault.guard") && index("vault.guard") < index("vault.guard.live.after");
       const record = { start: 0, auth: event.request.headers.get("authorization") };

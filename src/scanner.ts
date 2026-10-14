@@ -13,7 +13,9 @@ const patterns = [
   /\b(?:hvs|hvb|hvr)\.[A-Za-z0-9_-]{16,4096}\b/g,
   /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g,
   /\b(?:sk-(?:proj-|ant-api\d+-)?)[A-Za-z0-9_-]{32,512}\b/g,
-  /\b(?:glpat-|xox[baprs]-|npm_)[A-Za-z0-9_-]{20,255}\b/g,
+  /\b(?:glpat-|npm_)[A-Za-z0-9_-]{20,255}\b/g,
+  /\bxox[baprs]-[A-Za-z0-9_-]{10,48}(?![A-Za-z0-9_-])/g,
+  /\b[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}(?![A-Za-z0-9_-])/g,
   /\bglrt-[A-Za-z0-9_-]{20,}/g,
   /\bSG\.[A-Za-z0-9_-]{22,}\.[A-Za-z0-9_-]{40,}/g,
   /\bSK[a-fA-F0-9]{32}(?![A-Za-z0-9])/g,
@@ -27,9 +29,16 @@ const patterns = [
   /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]+@[^\s"'<>]+/gi,
   /\brediss?:\/\/[^\s:/@"'<>]*:[^\s/@"'<>]+@[^\s"'<>]+/gi,
   /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+\/-]{8,}={0,2}/gi,
-  /(?:\b|_)(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?(?:access[_-]?)?key|(?:access|session)[_-]?token)["']?\s*[:=]\s*["']?[^\s"',;}{]{8,}/gi,
+  /\bheroku\s*[:=]\s*["']?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![0-9a-f])/gi,
 ];
-const credentialKey = /(?:^|[_-])(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?(?:access[_-]?)?key|(?:access|session)[_-]?token)$/i;
+const credentialKey = /(?:^|[_-])(?:password|passwd|pwd|token|api[_-]?key|api[_-]?secret|secret(?:[_-]?(?:access[_-]?)?key)?|(?:access|session)[_-]?token)$/i;
+const assignment = /(?:\b|_)(?:password|passwd|pwd|token|api[_-]?key|api[_-]?secret|secret(?:[_-]?(?:access[_-]?)?key)?|(?:access|session)[_-]?token)["']?\s*[:=]\s*(?:"((?:\\.|[^"\\])*)"?|'((?:\\.|[^'\\])*)'?|(process\.env\[['"][A-Za-z_$][\w$]*['"]\])|([^\s"',;}{]+))/gi;
+
+// References name where a secret will be read from, not the value itself.
+// This exception applies only to contextual heuristics, never to known values.
+function isSourceReference(value: string): boolean {
+  return /^(?:process\.env\.(?:[A-Za-z_$][\w$]*)|process\.env\[['"][A-Za-z_$][\w$]*['"]\]|import\.meta\.env\.[A-Za-z_$][\w$]*)$/.test(value);
+}
 
 function entropy(value: string): number {
   const counts = new Map<string, number>();
@@ -76,11 +85,16 @@ export class Scanner {
         for (const pattern of patterns) {
           for (const match of text.matchAll(pattern)) add(match.index, match.index + match[0].length, "pattern");
         }
+        for (const match of text.matchAll(assignment)) {
+          const value = match[1] ?? match[2] ?? match[3] ?? match[4] ?? "";
+          if (value.length >= 8 && !isSourceReference(value)) add(match.index, match.index + match[0].length, "pattern");
+        }
       }
       if (this.options.entropy) {
-        for (const match of text.matchAll(/[A-Za-z0-9_+/=-]{24,256}/g)) {
+        for (const match of text.matchAll(/[A-Za-z0-9_+/=-]{24,}/g)) {
           const token = match[0];
-          if (!/^[a-f0-9]{40,64}$/i.test(token) && /[0-9]/.test(token) && /[a-z]/i.test(token) && entropy(token) >= 4.5) {
+          if (!/^[a-f0-9]{40,64}$/i.test(token) && /[0-9]/.test(token) && /[a-z]/i.test(token) &&
+            (entropy(token.slice(0, 256)) >= 4.5 || entropy(token) >= 4.5)) {
             add(match.index, match.index + token.length, "entropy");
           }
         }
@@ -117,7 +131,7 @@ export class Scanner {
           if (Object.hasOwn(result, cleanKey)) throw new GuardError("format");
           const before = counts.known + counts.pattern + counts.entropy;
           const clean = visit(item, depth + 1);
-          if (this.options.patterns && credentialKey.test(key) && typeof item === "string" && item.length >= 8 && item !== REDACTED) {
+          if (this.options.patterns && credentialKey.test(key) && typeof item === "string" && item.length >= 8 && item !== REDACTED && !isSourceReference(item)) {
             if (before === counts.known + counts.pattern + counts.entropy) counts.pattern++;
             result[cleanKey] = REDACTED;
           } else {
