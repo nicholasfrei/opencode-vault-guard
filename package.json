@@ -1,0 +1,30 @@
+{
+  "name": "opencode-vault-guard",
+  "version": "0.1.0",
+  "description": "Local, Vault-backed secret filtering for OpenCode V2 model requests",
+  "type": "module",
+  "main": "./dist/index.js",
+  "private": true,
+  "exports": {
+    ".": "./dist/index.js",
+    "./core": "./dist/guard.js"
+  },
+  "files": ["index.js", "dist", "README.md", "examples"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "test:smoke": "node --import tsx test/smoke.ts",
+    "test:metrics": "node --import tsx test/metrics-host.ts",
+    "test:live": "node --import tsx test/live-vault.ts",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": { "@opencode/plugin": ">=2.0.25 <2.1.0" },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.25",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "~/repos/opencode-vault-guard",
+      "options": {
+        "mode": "redact",
+        "metricsPort": 9464,
+        "vault": {
+          "address": "https://vault.example.com:8200",
+          "tokenFile": "/absolute/path/to/vault-agent-token",
+          "secrets": [
+            {
+              "mount": "kv",
+              "path": "development/credentials",
+              "fields": ["github_token", "aws_secret_access_key"]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

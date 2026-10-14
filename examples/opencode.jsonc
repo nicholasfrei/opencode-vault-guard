@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "~/repos/opencode-vault-guard",
+      "options": {
+        "mode": "redact",
+        "metricsPort": 9464,
+        "patterns": true,
+        "entropy": false
+      }
+    }
+  ]
+}
